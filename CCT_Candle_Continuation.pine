@@ -1,0 +1,280 @@
+//@version=6
+// Omit the scale argument. Setting one fits tags to the pane on their own
+// axis, so they stay locked when the price scale is zoomed.
+indicator("CCT Candle Continuation", overlay = true, max_labels_count = 500, max_lines_count = 500)
+
+string GRP_SIGNAL = "Signal"
+string GRP_DISPLAY = "Display"
+
+string candleTimeframe = input.timeframe("", "Candle timeframe", group = GRP_SIGNAL,
+     tooltip = "Candles used for the continuation. Chart follows the chart timeframe. A higher timeframe uses closed candles from that timeframe. The order block is always a chart candle, and the tag is drawn on the next chart order block after the continuation.")
+bool showSignals = input.bool(true, "Show buy/sell signals", group = GRP_DISPLAY,
+     tooltip = "Draws the tag on the chart order block that follows a captured continuation. BUY sits under that order block. SELL sits over it. A continuation with no later chart order block is left off the chart.")
+int signalStart = input.int(0, "Signal Window Start", minval = 0, maxval = 59, group = GRP_DISPLAY,
+     tooltip = "First minute of the exchange hour that can print a BUY or SELL label. 10 includes minute 10.")
+int signalEnd = input.int(59, "Signal Window End", minval = 0, maxval = 59, group = GRP_DISPLAY,
+     tooltip = "Last minute of the exchange hour that can print a BUY or SELL label. 50 includes minute 50. Start must be less than or equal to end.")
+float minimumStop = input.float(4, "Minimum stop (points)", minval = 0, group = GRP_SIGNAL,
+     tooltip = "Smallest distance from the signal candle to the stop, in points. The previous candle is used when it is beyond the signal by at least this distance. Otherwise the stop is this many points beyond the signal candle. A continuation close and an order-block close also have to clear the prior extreme by at least this distance. A smaller close does not arm a setup and does not print a tag.")
+
+string GRP_TARGET = "Target"
+string targetChoice = input.string("15M", "Timeframe Target", options = ["Off", "1M", "5M", "15M", "1H", "4H"], group = GRP_TARGET,
+     tooltip = "Take profit is the newest confirmed swing on this timeframe beyond the signal candle's close. A buy uses a swing high above that close. A sell uses a swing low below it. A wick through the swing does not skip it. When no swing is beyond the close, the target is two times the distance from that close to the stop. Off does not use a swing. Max Target then sets the target, and 0 leaves it empty. The tag is left off when a target is closer to the confirming close than the stop is. Equal to that distance still prints.")
+int minRr = input.int(0, "Min RR", minval = 0, maxval = 50, group = GRP_TARGET,
+     tooltip = "The tag, stop, and target still print when the target pays less than this multiple of the stop distance. The label tooltip shows Min RR. 0 keeps the tooltip clear.")
+int maxTarget = input.int(0, "Max Target", minval = 0, maxval = 50, group = GRP_TARGET,
+     tooltip = "When Timeframe Target is Off, the target is this multiple of the stop distance. 3 draws it at 1:3 on the signal candle, and 0 leaves the target empty. When a swing timeframe is selected, this caps a swing farther than this multiple. A closer swing stays on its own candle. 0 leaves that swing unchanged. The two-times fallback stays at two times.")
+int swingLength = input.int(2, "Target Swing Length", minval = 1, maxval = 20, group = GRP_TARGET,
+     tooltip = "Bars required on each side of a target-timeframe pivot. The pivot is usable only after that many later candles have closed.")
+
+string monitorPeriod = candleTimeframe == "" ? timeframe.period : candleTimeframe
+bool sameTimeframe = monitorPeriod == timeframe.period
+
+bool swingTargetOn = targetChoice != "Off"
+bool targetOn = swingTargetOn or maxTarget > 0
+string targetPine = targetChoice == "4H" ? "240" : targetChoice == "1H" ? "60" : targetChoice == "15M" ? "15" : targetChoice == "5M" ? "5" : targetChoice == "1M" ? "1" : timeframe.period
+int targetMs = targetChoice == "4H" ? 14400000 : targetChoice == "1H" ? 3600000 : targetChoice == "15M" ? 900000 : targetChoice == "5M" ? 300000 : targetChoice == "1M" ? 60000 : timeframe.in_seconds() * 1000
+
+if barstate.isfirst and timeframe.in_seconds(monitorPeriod) < timeframe.in_seconds()
+    runtime.error("Candle timeframe must be the chart timeframe or higher.")
+if barstate.isfirst and swingTargetOn and timeframe.in_seconds(targetPine) < timeframe.in_seconds()
+    runtime.error("Timeframe Target must be the chart timeframe or higher.")
+
+// Offsets [1] and [2] are closed monitor candles. lookahead_on publishes that
+// closed pair on the chart bar that opens the next monitor period.
+// [2] is the setup and [1] is the continuation. The order block stays on the
+// chart: a bearish chart candle, then a bullish close above its high, or the inverse.
+// That close has to clear the prior extreme by at least Minimum stop.
+monitorState() =>
+    bool bullishDisplacement = close[1] > open[1] and close[1] > high[2] and close[1] - high[2] >= minimumStop
+    bool bearishDisplacement = close[1] < open[1] and close[1] < low[2] and low[2] - close[1] >= minimumStop
+    bool bullishContinuation = close[2] > open[2] and bullishDisplacement
+    bool bearishContinuation = close[2] < open[2] and bearishDisplacement
+    int continuationDirection = bullishContinuation ? 1 : bearishContinuation ? -1 : 0
+    [continuationDirection, time[1]]
+
+[closedContinuation, closedContinuationTime] = request.security(
+     syminfo.tickerid, monitorPeriod, monitorState(), lookahead = barmerge.lookahead_on)
+
+// Closed target-timeframe candles. A pivot needs Target Swing Length bars on
+// each side, so it is stored only after those later candles have closed.
+[closedTargetTime, closedTargetHigh, closedTargetLow] = request.security(
+     syminfo.tickerid, targetPine, [time[1], high[1], low[1]], lookahead = barmerge.lookahead_on)
+
+var float[] targetHighs = array.new<float>()
+var float[] targetLows = array.new<float>()
+var int[] targetTimes = array.new<int>()
+var float[] swingPrices = array.new<float>()
+var int[] swingKinds = array.new<int>()
+var int[] swingTimes = array.new<int>()
+var int lastTargetTime = na
+int pivotWindow = swingLength * 2 + 1
+
+if swingTargetOn and not na(closedTargetTime) and (na(lastTargetTime) or closedTargetTime != lastTargetTime)
+    lastTargetTime := closedTargetTime
+    array.push(targetHighs, closedTargetHigh)
+    array.push(targetLows, closedTargetLow)
+    array.push(targetTimes, closedTargetTime)
+    if array.size(targetHighs) > pivotWindow
+        array.shift(targetHighs)
+        array.shift(targetLows)
+        array.shift(targetTimes)
+    if array.size(targetHighs) == pivotWindow
+        float pivotHigh = array.get(targetHighs, swingLength)
+        float pivotLow = array.get(targetLows, swingLength)
+        bool isHigh = true
+        bool isLow = true
+        for pivotIndex = 0 to pivotWindow - 1
+            if pivotIndex != swingLength
+                if array.get(targetHighs, pivotIndex) >= pivotHigh
+                    isHigh := false
+                if array.get(targetLows, pivotIndex) <= pivotLow
+                    isLow := false
+        int pivotTime = array.get(targetTimes, swingLength)
+        if isHigh
+            array.push(swingPrices, pivotHigh)
+            array.push(swingKinds, 1)
+            array.push(swingTimes, pivotTime)
+        if isLow
+            array.push(swingPrices, pivotLow)
+            array.push(swingKinds, -1)
+            array.push(swingTimes, pivotTime)
+        while array.size(swingPrices) > 50
+            array.shift(swingPrices)
+            array.shift(swingKinds)
+            array.shift(swingTimes)
+
+latestSwing(float price, bool bullish) =>
+    float foundPrice = na
+    int foundTime = na
+    int kind = bullish ? 1 : -1
+    int count = array.size(swingPrices)
+    if not na(price) and count > 0
+        for swingIndex = count - 1 to 0
+            float swingPrice = array.get(swingPrices, swingIndex)
+            bool beyond = bullish ? swingPrice > price : swingPrice < price
+            if array.get(swingKinds, swingIndex) == kind and beyond
+                foundPrice := swingPrice
+                foundTime := array.get(swingTimes, swingIndex)
+                break
+    [foundPrice, foundTime]
+
+// Same-timeframe continuations are read on the chart. request.security on the
+// chart timeframe returns ordinary chart offsets, which would confirm one bar late.
+bool chartBullishDisplacement = close > open and close > high[1] and close - high[1] >= minimumStop
+bool chartBearishDisplacement = close < open and close < low[1] and low[1] - close >= minimumStop
+bool chartBullishContinuation = close[1] > open[1] and chartBullishDisplacement
+bool chartBearishContinuation = close[1] < open[1] and chartBearishDisplacement
+bool chartBullishOrderBlock = close[1] < open[1] and chartBullishDisplacement
+bool chartBearishOrderBlock = close[1] > open[1] and chartBearishDisplacement
+
+bool monitorBar = sameTimeframe or timeframe.change(monitorPeriod)
+int continuationDirection = sameTimeframe ? (chartBullishContinuation ? 1 : chartBearishContinuation ? -1 : 0) : closedContinuation
+int continuationTime = sameTimeframe ? time : closedContinuationTime
+int orderBlockDirection = chartBullishOrderBlock ? 1 : chartBearishOrderBlock ? -1 : 0
+int anchorTime = time[1]
+float anchorLow = low[1]
+float anchorHigh = high[1]
+int anchorMinute = minute(anchorTime, syminfo.timezone)
+bool inSignalWindow = not na(anchorMinute) and anchorMinute >= signalStart and anchorMinute <= signalEnd
+
+var int lastSignalDirection = 0
+var int capturedTime = na
+var bool waitingForOrderBlock = false
+
+// The anchor is a chart candle and has to open after the captured continuation.
+// Resolve this before a new capture so the displacement bar can still place
+// the tag that was already waiting.
+bool orderBlockFollows = barstate.isconfirmed and waitingForOrderBlock and orderBlockDirection == lastSignalDirection and not na(capturedTime) and anchorTime > capturedTime
+bool showBuy = orderBlockFollows and lastSignalDirection == 1
+bool showSell = orderBlockFollows and lastSignalDirection == -1
+
+if showBuy or showSell
+    waitingForOrderBlock := false
+
+bool captureBuy = barstate.isconfirmed and monitorBar and continuationDirection == 1 and lastSignalDirection != 1
+bool captureSell = barstate.isconfirmed and monitorBar and continuationDirection == -1 and lastSignalDirection != -1
+
+if captureBuy
+    lastSignalDirection := 1
+    capturedTime := continuationTime
+    waitingForOrderBlock := true
+else if captureSell
+    lastSignalDirection := -1
+    capturedTime := continuationTime
+    waitingForOrderBlock := true
+
+// The stop is the candle before the signal when that candle is beyond the
+// signal by at least Minimum stop. Otherwise it is Minimum stop points beyond
+// the signal candle.
+bool buyUsesPrevious = low[2] < low[1] and low[1] - low[2] >= minimumStop
+float buyStop = buyUsesPrevious ? low[2] : low[1] - minimumStop
+int buyStopTime = buyUsesPrevious ? time[2] : time[1]
+bool sellUsesPrevious = high[2] > high[1] and high[2] - high[1] >= minimumStop
+float sellStop = sellUsesPrevious ? high[2] : high[1] + minimumStop
+int sellStopTime = sellUsesPrevious ? time[2] : time[1]
+int stopSpan = timeframe.in_seconds() * 2000
+int targetSpan = targetMs * 2
+float signalClose = close[1]
+[buySwingPrice, buySwingTime] = latestSwing(signalClose, true)
+[sellSwingPrice, sellSwingTime] = latestSwing(signalClose, false)
+
+bool buyStopOk = targetOn and not na(buyStop) and not na(signalClose) and buyStop < signalClose
+float buyRisk = buyStopOk ? signalClose - buyStop : na
+float buyTarget = na
+int buyTargetTime = na
+bool buyUnderMinRr = false
+if buyStopOk
+    if swingTargetOn
+        buyTarget := na(buySwingPrice) ? signalClose + buyRisk * 2 : buySwingPrice
+        buyTargetTime := na(buySwingPrice) ? na : buySwingTime
+    else
+        buyTarget := signalClose + buyRisk * maxTarget
+        buyTargetTime := na
+    float buyReward = buyTarget - signalClose
+    if maxTarget > 0 and not na(buyTargetTime) and buyReward > maxTarget * buyRisk
+        buyTarget := signalClose + buyRisk * maxTarget
+        buyTargetTime := na
+        buyReward := maxTarget * buyRisk
+    if minRr > 0 and buyReward < minRr * buyRisk
+        buyUnderMinRr := true
+
+bool sellStopOk = targetOn and not na(sellStop) and not na(signalClose) and sellStop > signalClose
+float sellRisk = sellStopOk ? sellStop - signalClose : na
+float sellTarget = na
+int sellTargetTime = na
+bool sellUnderMinRr = false
+if sellStopOk
+    if swingTargetOn
+        sellTarget := na(sellSwingPrice) ? signalClose - sellRisk * 2 : sellSwingPrice
+        sellTargetTime := na(sellSwingPrice) ? na : sellSwingTime
+    else
+        sellTarget := signalClose - sellRisk * maxTarget
+        sellTargetTime := na
+    float sellReward = signalClose - sellTarget
+    if maxTarget > 0 and not na(sellTargetTime) and sellReward > maxTarget * sellRisk
+        sellTarget := signalClose - sellRisk * maxTarget
+        sellTargetTime := na
+        sellReward := maxTarget * sellRisk
+    if minRr > 0 and sellReward < minRr * sellRisk
+        sellUnderMinRr := true
+
+string buyTip = "Stop " + str.tostring(buyStop, format.mintick)
+if not na(buyTarget)
+    buyTip := buyTip + "\nTP " + str.tostring(buyTarget, format.mintick)
+if buyUnderMinRr
+    buyTip := buyTip + "\nMin RR"
+string sellTip = "Stop " + str.tostring(sellStop, format.mintick)
+if not na(sellTarget)
+    sellTip := sellTip + "\nTP " + str.tostring(sellTarget, format.mintick)
+if sellUnderMinRr
+    sellTip := sellTip + "\nMin RR"
+
+// A target has to leave at least the stop distance beyond the confirming close.
+// Equal qualifies. No target leaves the stop rule unchanged.
+bool buyRoomOk = na(buyTarget) or buyTarget - close >= close - buyStop
+bool sellRoomOk = na(sellTarget) or close - sellTarget >= sellStop - close
+
+if showSignals and showBuy and inSignalWindow and buyRoomOk
+    label.new(anchorTime, anchorLow, "BUY",
+         xloc = xloc.bar_time,
+         yloc = yloc.price,
+         style = label.style_label_up,
+         color = color.green,
+         textcolor = color.white,
+         size = size.small,
+         tooltip = buyTip)
+    if not na(buyStop)
+        line.new(buyStopTime, buyStop, buyStopTime + stopSpan, buyStop,
+             xloc = xloc.bar_time, color = color.red, width = 1)
+    if not na(buyTarget)
+        int buyOrigin = na(buyTargetTime) ? anchorTime : buyTargetTime
+        line.new(buyOrigin, buyTarget, buyOrigin + targetSpan, buyTarget,
+             xloc = xloc.bar_time, color = color.green, width = 1)
+        if not na(buyTargetTime) and buyTargetTime != anchorTime
+            line.new(anchorTime, buyTarget, anchorTime + targetSpan, buyTarget,
+                 xloc = xloc.bar_time, color = color.green, width = 1)
+if showSignals and showSell and inSignalWindow and sellRoomOk
+    label.new(anchorTime, anchorHigh, "SELL",
+         xloc = xloc.bar_time,
+         yloc = yloc.price,
+         style = label.style_label_down,
+         color = color.red,
+         textcolor = color.white,
+         size = size.small,
+         tooltip = sellTip)
+    if not na(sellStop)
+        line.new(sellStopTime, sellStop, sellStopTime + stopSpan, sellStop,
+             xloc = xloc.bar_time, color = color.red, width = 1)
+    if not na(sellTarget)
+        int sellOrigin = na(sellTargetTime) ? anchorTime : sellTargetTime
+        line.new(sellOrigin, sellTarget, sellOrigin + targetSpan, sellTarget,
+             xloc = xloc.bar_time, color = color.green, width = 1)
+        if not na(sellTargetTime) and sellTargetTime != anchorTime
+            line.new(anchorTime, sellTarget, anchorTime + targetSpan, sellTarget,
+                 xloc = xloc.bar_time, color = color.green, width = 1)
+
+alertcondition(showBuy and inSignalWindow and buyRoomOk, title = "CCT Buy",
+     message = "CCT Buy: a bullish order block followed the buy continuation.")
+alertcondition(showSell and inSignalWindow and sellRoomOk, title = "CCT Sell",
+     message = "CCT Sell: a bearish order block followed the sell continuation.")
